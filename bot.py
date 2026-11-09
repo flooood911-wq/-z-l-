@@ -2,74 +2,113 @@ import telebot
 import requests
 import os
 from rahad_all_downloader import alldl
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from flask import Flask
+from threading import Thread
+
+# --- إعداد خادم الويب الوهمي لـ Render ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+# ------------------------------------------
 
 TOKEN = "9116034002:AAHBVC2uB9JcD20shhS-IwAMMTyEuDPQchk"
 bot = telebot.TeleBot(TOKEN)
 
-print("البوت يعمل الآن... جرب إرسال رابط فيديو!")
+download_count = 0
+user_links = {}
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "أهلاً بك! 👋\nأرسل لي رابط فيديو من أي منصة (تيك توك، يوتيوب، إنستغرام، فيسبوك...) وسأقوم بتنزيله لك فوراً وبدون علامة مائية.")
+    bot.reply_to(message, "أهلاً بك! 👋\nأرسل لي رابط فيديو وسأسألك كيف تريد حفظه (فيديو عادي أو ملف مخفي).")
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    bot.reply_to(message, f"📊 إحصائيات البوت:\nتم تنزيل **{download_count}** فيديو بنجاح حتى الآن!")
 
 @bot.message_handler(func=lambda message: message.text and message.text.startswith('http'))
-def download_video(message):
+def ask_download_type(message):
     url = message.text.split()[0]
+    user_links[message.chat.id] = url
     
-    # حذف رسالة المستخدم (الرابط) للحفاظ على نظافة المحادثة
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except:
-        pass
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 2
+    markup.add(
+        InlineKeyboardButton("🎬 فيديو عادي", callback_data="vid_normal"),
+        InlineKeyboardButton("📁 ملف مخفي (Document)", callback_data="vid_doc")
+    )
+    
+    bot.reply_to(message, "🔗 تم استلام الرابط. كيف تريد حفظه؟", reply_markup=markup)
 
-    # إرسال رسالة الانتظار
-    msg = bot.send_message(message.chat.id, "⏳ جاري جلب الرابط وتنزيل الفيديو...")
+@bot.callback_query_handler(func=lambda call: call.data in ["vid_normal", "vid_doc", "retry"])
+def handle_choice(call):
+    global download_count
+    chat_id = call.message.chat.id
     
-    filename = f"video_{message.chat.id}.mp4"
+    if call.data == "retry":
+        bot.delete_message(chat_id, call.message.message_id)
+        process_video(chat_id, user_links.get(chat_id), "vid_normal")
+        return
+
+    url = user_links.get(chat_id)
+    if not url:
+        bot.answer_callback_query(call.id, "⚠️ الرابط غير متوفر. أرسله مرة أخرى.")
+        return
+
+    bot.delete_message(chat_id, call.message.message_id)
+    process_video(chat_id, url, call.data)
+
+def process_video(chat_id, url, mode):
+    global download_count
+    msg = bot.send_message(chat_id, "⏳ جاري جلب الرابط وتنزيل الفيديو...")
+    filename = f"video_{chat_id}.mp4"
     
     try:
-        # جلب الرابط
         result = alldl(url)
-        
-        if not result.get("success"):
-            bot.edit_message_text("❌ فشلت عملية جلب الرابط. قد يكون الرابط غير مدعوم أو الحساب خاص.", message.chat.id, msg.message_id)
-            return
-
-        video_url = result.get("videoUrl")
-        if not video_url and "data" in result:
-            video_url = result["data"].get("videoUrl")
+        video_url = result.get("videoUrl") or result.get("data", {}).get("videoUrl")
         
         if not video_url:
-            bot.edit_message_text("❌ لم يتم العثور على رابط تحميل مباشر. جرب رابطاً آخر.", message.chat.id, msg.message_id)
-            return
+            raise Exception("لم يتم العثور على رابط مباشر.")
 
-        # تنزيل الفيديو
-        video_response = requests.get(video_url, stream=True, timeout=60)
-        video_response.raise_for_status()
+        response = requests.get(video_url, stream=True, timeout=60)
+        response.raise_for_status()
         
         with open(filename, 'wb') as f:
-            for chunk in video_response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        # إرسال الفيديو
-        with open(filename, 'rb') as video:
-            bot.send_video(message.chat.id, video, caption="✅ تم التنزيل بنجاح")
+        with open(filename, 'rb') as media:
+            if mode == "vid_doc":
+                bot.send_document(chat_id, media, caption="✅ تم التنزيل (ملف مخفي)")
+            else:
+                bot.send_video(chat_id, media, caption="✅ تم التنزيل بنجاح")
         
-        # حذف رسالة الانتظار بعد نجاح الإرسال
-        bot.delete_message(message.chat.id, msg.message_id)
-        
-        # حذف الملف المؤقت
+        download_count += 1
+        bot.delete_message(chat_id, msg.message_id)
         os.remove(filename)
+        user_links.pop(chat_id, None)
         
     except Exception as e:
-        error_msg = str(e)[:50]
-        bot.edit_message_text(f"❌ حدث خطأ أثناء التنزيل.\nالسبب: {error_msg}...", message.chat.id, msg.message_id)
-        print(f"Error: {e}")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔄 إعادة المحاولة", callback_data="retry"))
+        bot.edit_message_text(f"❌ فشل التنزيل.\nالسبب: {str(e)[:50]}", chat_id, msg.message_id, reply_markup=markup)
+        
         if os.path.exists(filename):
             os.remove(filename)
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
-    bot.reply_to(message, "⚠️ أرسل لي رابط فيديو صحيح (يبدأ بـ http) لأقوم بتنزيله.")
+    bot.reply_to(message, "⚠️ أرسل لي رابطاً صحيحاً (يبدأ بـ http).")
 
+# تشغيل خادم الويب والبوت معاً
+keep_alive()
 bot.infinity_polling()
